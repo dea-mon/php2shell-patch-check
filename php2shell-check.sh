@@ -28,7 +28,7 @@
 set -u
 export LC_ALL=C
 
-TOOL_VERSION="1.3.0"
+TOOL_VERSION="1.3.2"
 CVE_A="CVE-2026-109618"
 CVE_B="CVE-2026-109619"
 SINCE="2026-10-16"          # attacks seen from 17 Oct; look a day earlier
@@ -158,25 +158,32 @@ ver_ge() { # ver_ge A B  -> true if A >= B
 major_minor() { printf '%s' "$1" | awk -F. '{print $1"."$2}'; }
 
 # ---------- package helpers ----------
-PKG_TOOL=""
-command -v dpkg-query >/dev/null 2>&1 && PKG_TOOL="dpkg"
-[ -z "$PKG_TOOL" ] && command -v rpm >/dev/null 2>&1 && PKG_TOOL="rpm"
+# Both tools can be present (e.g. EPEL's dpkg on AlmaLinux/RHEL), so ask each one
+# in turn which package owns a file, and keep using the tool that answered.
+PKG_TOOLS=()
+command -v dpkg-query >/dev/null 2>&1 && PKG_TOOLS+=(dpkg)
+command -v rpm >/dev/null 2>&1 && PKG_TOOLS+=(rpm)
 
-pkg_owner() { # file -> package name or empty
-  case "$PKG_TOOL" in
-    dpkg) dpkg-query -S "$1" 2>/dev/null | head -n1 | cut -d: -f1 | cut -d, -f1 ;;
-    rpm)  rpm -qf --qf '%{NAME}\n' "$1" 2>/dev/null | grep -v 'not owned' | head -n1 ;;
-  esac
+pkg_owner() { # file -> "tool package", or empty
+  local t n
+  for t in "${PKG_TOOLS[@]}"; do
+    case "$t" in
+      dpkg) n="$(dpkg-query -S "$1" 2>/dev/null | head -n1 | cut -d: -f1 | cut -d, -f1)" ;;
+      rpm)  n="$(rpm -qf --qf '%{NAME}\n' "$1" 2>/dev/null | grep -v 'not owned' | head -n1)" ;;
+    esac
+    [ -n "$n" ] && { printf '%s %s\n' "$t" "$n"; return; }
+  done
 }
-pkg_version() {
+pkg_version() { # tool package
+  local PKG_TOOL="$1"; shift
   case "$PKG_TOOL" in
     dpkg) dpkg-query -W -f='${Version}' "$1" 2>/dev/null ;;
     rpm)  rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null ;;
   esac
 }
 # Prints: both | one | none | nolog
-pkg_cve_status() {
-  local pkg="$1" log="" a=0 b=0 f
+pkg_cve_status() { # tool package
+  local PKG_TOOL="$1" pkg="$2" log="" a=0 b=0 f
   case "$PKG_TOOL" in
     dpkg)
       for f in "/usr/share/doc/$pkg/changelog.Debian.gz" "/usr/share/doc/$pkg/changelog.gz"; do
@@ -329,8 +336,9 @@ RESULTS=()
 assess() {
   local kind="$1" path="$2" ver="$3" pkg pkgver cve mm fix status reason run="no"
   [ -n "${RUNNING[$path]:-}" ] && run="yes"
-  pkg="$(pkg_owner "$path")"; pkgver=""; cve="nolog"
-  if [ -n "$pkg" ]; then pkgver="$(pkg_version "$pkg")"; cve="$(pkg_cve_status "$pkg")"; fi
+  local owner ptool
+  owner="$(pkg_owner "$path")"; ptool="${owner%% *}"; pkg="${owner#* }"; pkgver=""; cve="nolog"
+  if [ -n "$owner" ]; then pkgver="$(pkg_version "$ptool" "$pkg")"; cve="$(pkg_cve_status "$ptool" "$pkg")"; fi
 
   if [ -z "$ver" ]; then
     status="UNKNOWN"; reason="could not read the PHP version"
@@ -381,9 +389,9 @@ for c in "${CONTAINER_PHP[@]}"; do
   RESULTS+=("container|pid ${c%%|*}: ${c#*|}|?|-|-|UNKNOWN|PHP is running inside a container, which this check can't see into. Run the check inside the container, or rebuild its image on a fixed PHP|yes")
 done
 for so in "${MODPHP[@]}"; do
-  pkg="$(pkg_owner "$so")"; ver=""
-  if [ -n "$pkg" ]; then
-    ver="$(pkg_version "$pkg" | sed -e 's/^[0-9]*://' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+  owner="$(pkg_owner "$so")"; ver=""
+  if [ -n "$owner" ]; then
+    ver="$(pkg_version "${owner%% *}" "${owner#* }" | sed -e 's/^[0-9]*://' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
   fi
   assess "apache-mod_php" "$so" "$ver"
   [ -n "$ver" ] && upload_progress_from_ini "apache-mod_php" "$so" "$ver"
@@ -460,12 +468,15 @@ fi
 LOG_SHELL=(); LOG_PROBE=(); LOG_CRASH=(); LOG_FILES=0; LOG_TRUNCATED="false"; LOG_DIRS_USED=""
 if [ "$SCAN_LOGS" -eq 1 ]; then
   shopt -s nullglob
-  LOGDIRS=()
+  LOGDIRS=(); declare -A LOGDIR_SEEN=()
   for d in /var/log/apache2 /var/log/httpd /var/log/nginx /var/log/php*-fpm* /var/log/php-fpm /var/log/php \
            /usr/local/apache/logs /usr/local/apache/domlogs /etc/apache2/logs/domlogs \
            /var/www/vhosts/*/logs /var/www/vhosts/system/*/logs /usr/local/lsws/logs /var/log/litespeed \
            /opt/cpanel/ea-php*/root/usr/var/log /opt/plesk/php/*/var/log /home/*/logs; do
-    [ -e "$d" ] && LOGDIRS+=("$d")
+    [ -e "$d" ] || continue
+    rd="$(readlink -f "$d" 2>/dev/null || echo "$d")"   # globs overlap (php*-fpm* and php-fpm)
+    [ -n "${LOGDIR_SEEN[$rd]:-}" ] && continue
+    LOGDIR_SEEN[$rd]=1; LOGDIRS+=("$d")
   done
   shopt -u nullglob
   LOG_DIRS_USED="${LOGDIRS[*]:-}"
