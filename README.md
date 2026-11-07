@@ -49,7 +49,7 @@ Run it only on servers you own or are authorised to manage.
 Check a self-hosted runner, or a build image, in CI:
 
 ```yaml
-- uses: dea-mon/php2shell-patch-check@v1.3.1
+- uses: dea-mon/php2shell-patch-check@v1.3.2
   with:
     fail-on: action-needed   # or: not-confirmed, never
 ```
